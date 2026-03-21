@@ -35,8 +35,20 @@ You can either install the pre-compiled VSIX or build from source.
 
 Once the extension is installed and VS Code is running, the MCP server automatically starts in the background and listens for SSE connections on port `6070`.
 
-To connect your AI client (like Claude Desktop, Antigravity, or Cursor), add the following configuration to your MCP settings file (e.g., `mcp.json`):
+To connect your AI client, add the appropriate configuration to your MCP settings file:
 
+**For Antigravity (`mcp_config.json`):**
+```json
+{
+  "mcpServers": {
+    "vscode-diff-mcp": {
+      "serverUrl": "http://127.0.0.1:6070/mcp"
+    }
+  }
+}
+```
+
+**For other standard MCP Clients (`mcp.json`):**
 ```json
 {
   "servers": {
