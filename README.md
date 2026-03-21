@@ -17,7 +17,7 @@ Instead of AI agents blindly overwriting files, this extension generates an inte
 You can either install the pre-compiled VSIX or build from source.
 
 ### Option 1: Install from VSIX (Recommended)
-1. Go to the [Actions tab](https://github.com/iiNothh/vscode-diff-mcp/actions) or the Repository Releases.
+1. Go to the [Actions tab](https://github.com/iiNothh/vscode-diff-mcp/actions).
 2. Download the latest `vscode-diff-mcp-vsix` artifact.
 3. Open VS Code, press `Ctrl+Shift+P` (or `Cmd+Shift+P` on Mac).
 4. Type and select **Extensions: Install from VSIX...**
