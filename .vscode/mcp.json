@@ -1,6 +1,6 @@
 {
   "servers": {
-    "vscode-diff-mcp": {
+    "ai-diff-review-mcp": {
       "url": "http://127.0.0.1:6070/mcp"
     }
   }

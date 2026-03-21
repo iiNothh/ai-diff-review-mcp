@@ -1,4 +1,4 @@
-# VS Code Diff MCP Server
+# AI Diff Review (MCP)
 
 A Model Context Protocol (MCP) server that runs directly inside your Visual Studio Code. It empowers AI agents with advanced, state-of-the-art file editing capabilities while ensuring you stay in complete control of your codebase.
 
@@ -17,15 +17,15 @@ Instead of AI agents blindly overwriting files, this extension generates an inte
 You can either install the pre-compiled VSIX or build from source.
 
 ### Option 1: Install from VSIX (Recommended)
-1. Go to the [Actions tab](https://github.com/iiNothh/vscode-diff-mcp/actions).
-2. Download the latest `vscode-diff-mcp-vsix` artifact.
+1. Go to the [Actions tab](https://github.com/iiNothh/ai-diff-review-mcp/actions).
+2. Download the latest `ai-diff-review-mcp-vsix` artifact.
 3. Open VS Code, press `Ctrl+Shift+P` (or `Cmd+Shift+P` on Mac).
 4. Type and select **Extensions: Install from VSIX...**
 5. Select the `.vsix` file you just downloaded.
 6. Reload VS Code.
 
 ### Option 2: Build from Source
-1. Clone the repository: `git clone https://github.com/iiNothh/vscode-diff-mcp.git`
+1. Clone the repository: `git clone https://github.com/iiNothh/ai-diff-review-mcp.git`
 2. Run `npm install` to install dependencies.
 3. Run `npm run compile` to build the typescript files.
 4. Run `npx @vscode/vsce package` to create the VSIX file.
@@ -41,7 +41,7 @@ To connect your AI client, add the appropriate configuration to your MCP setting
 ```json
 {
   "mcpServers": {
-    "vscode-diff-mcp": {
+    "ai-diff-review-mcp": {
       "serverUrl": "http://127.0.0.1:6070/mcp"
     }
   }
@@ -52,7 +52,7 @@ To connect your AI client, add the appropriate configuration to your MCP setting
 ```json
 {
   "servers": {
-    "vscode-diff-mcp": {
+    "ai-diff-review-mcp": {
       "url": "http://127.0.0.1:6070/mcp"
     }
   }

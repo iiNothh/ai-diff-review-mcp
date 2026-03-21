@@ -1,6 +1,6 @@
 {
-  "name": "difference-mcp",
-  "displayName": "Difference MCP",
+  "name": "ai-diff-review-mcp",
+  "displayName": "AI Diff Review (MCP)",
   "description": "MCP server for AI agents with interactive diff Accept/Reject workflow",
   "version": "0.1.0",
   "publisher": "DifferenceMCP",
