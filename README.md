@@ -1,5 +1,7 @@
 # AI Diff Review (MCP)
 
+[![VS Code Marketplace](https://img.shields.io/visual-studio-marketplace/v/DifferenceMCP.ai-diff-review-mcp?label=VS%20Code%20Marketplace)](https://marketplace.visualstudio.com/items?itemName=DifferenceMCP.ai-diff-review-mcp)
+
 A Model Context Protocol (MCP) server that runs directly inside your Visual Studio Code. It empowers AI agents with advanced, state-of-the-art file editing capabilities while ensuring you stay in complete control of your codebase.
 
 Instead of AI agents blindly overwriting files, this extension generates an interactive diff review panel inside VS Code, allowing you to explicitly Accept or Reject any changes proposed by the AI.
