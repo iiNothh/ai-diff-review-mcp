@@ -1,0 +1,8 @@
+node_modules/
+out/
+.vscode-test/
+*.vsix
+.vscode/mcp-diff-state/
+.antigravity.rules
+.gemini/
+.env

@@ -1,0 +1,8 @@
+{
+  "servers": {
+    "vscode-diff-mcp": {
+      "type": "sse",
+      "url": "http://127.0.0.1:6070/sse"
+    }
+  }
+}

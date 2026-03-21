@@ -1,0 +1,12 @@
+.vscode-test/
+node_modules/
+src/
+*.ts
+tsconfig.json
+esbuild.js
+test*.txt
+.vscode/mcp-diff-state/
+.vscode/mcp.json
+.vscode/launch.json
+.gitignore
+temp-desktop-commander/
