@@ -409,20 +409,27 @@ Saves state, backups original, and opens diff reviewer.`,
     {
       title: 'Edit Block',
       description: `Apply a surgical find-and-replace edit to a file.
-Finds exact 'oldString' and replaces with 'newString'.
-If exact match fails, fuzzy search automatically detects close matches and informs you.
-Can be called multiple times on the same file; changes will be grouped in one diff.`,
+
+IMPORTANT: Always call read_file first to get the exact current content and line numbers.
+
+Provide startLine and endLine to pin exactly where oldString appears (1-indexed, inclusive).
+The search is constrained to that range — if oldString is not found there, the actual content
+of that range is returned so you can correct it. This prevents accidentally replacing the wrong
+occurrence in files with repeated code.
+
+Can be called multiple times on the same file; all changes are grouped in one diff entry.`,
       inputSchema: {
         filePath: z.string().describe('Absolute or workspace-relative file path'),
-        oldString: z.string().describe('String to find and replace. Must match the target file exactly (or closely for fuzzy).'),
-        newString: z.string().describe('Replacement string.'),
-        expectedReplacements: z.number().default(1).describe('How many occurrences are expected to be replaced (default 1)'),
+        oldString: z.string().describe('Exact text to find and replace within the specified line range.'),
+        newString: z.string().describe('Replacement text.'),
+        startLine: z.number().describe('First line of the search range (1-indexed, inclusive).'),
+        endLine: z.number().describe('Last line of the search range (1-indexed, inclusive).'),
         description: z.string().optional(),
         conversationId: z.string().optional(),
       },
       annotations: { destructiveHint: false },
     },
-    async ({ filePath, oldString, newString, expectedReplacements, description, conversationId }) => {
+    async ({ filePath, oldString, newString, startLine, endLine, description, conversationId }) => {
       const workspaceRoot = getWorkspaceRoot();
       if (!workspaceRoot) {
         return { content: [{ type: 'text' as const, text: 'Error: No workspace folder open.' }], isError: true };
@@ -432,12 +439,12 @@ Can be called multiple times on the same file; changes will be grouped in one di
       let operationResult: any;
 
       try {
-        const { performSearchReplace } = await import('./file-edit-engine.js');
+        const { performLineAnchoredReplace } = await import('./file-edit-engine.js');
 
         const change = await stateManager.trackFileOperation(
           absolutePath,
           async () => {
-            operationResult = await performSearchReplace(absolutePath, oldString, newString, expectedReplacements);
+            operationResult = await performLineAnchoredReplace(absolutePath, oldString, newString, startLine, endLine);
             if (!operationResult.success) {
               throw new Error(operationResult.message);
             }
@@ -447,11 +454,135 @@ Can be called multiple times on the same file; changes will be grouped in one di
           conversationId
         );
 
-        return await finishEditAndReport(absolutePath, change, `Edit block applied successfully.`);
+        return await finishEditAndReport(absolutePath, change, `Edit block applied successfully (lines ${startLine}-${endLine}).`);
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
         return { content: [{ type: 'text' as const, text: `${errMsg}` }], isError: true };
       }
+    }
+  );
+
+  // ─────────────────────────────────────────────────────────
+  // Tool: search_in_files
+  // ─────────────────────────────────────────────────────────
+  server.registerTool(
+    'search_in_files',
+    {
+      title: 'Search in Files',
+      description: `Search for a literal string or regex pattern across workspace files.
+Returns file paths and matching line numbers. Use this to locate code before reading or editing.
+Examples: find all usages of a function, locate an import, find a config key.`,
+      inputSchema: {
+        pattern: z.string().describe('Text to search for (literal string or regex if isRegex is true)'),
+        isRegex: z.boolean().default(false).describe('Treat pattern as a regular expression (default: false)'),
+        fileGlob: z.string().default('**/*').describe('Glob pattern to restrict which files are searched (e.g. "**/*.ts")'),
+        excludeGlob: z.string().optional().describe('Glob pattern to exclude (default excludes node_modules, .git, out, dist)'),
+        maxResults: z.number().default(100).describe('Maximum total matches to return (default 100)'),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ pattern, isRegex, fileGlob, excludeGlob, maxResults }) => {
+      const workspaceRoot = getWorkspaceRoot();
+      if (!workspaceRoot) {
+        return { content: [{ type: 'text' as const, text: 'Error: No workspace folder open.' }], isError: true };
+      }
+
+      try {
+        const exclude = excludeGlob ?? '{**/node_modules/**,**/.git/**,**/out/**,**/dist/**,**/.vscode/mcp-diff-state/**}';
+        const uris = await vscode.workspace.findFiles(fileGlob, exclude, 500);
+
+        const { searchInFile } = await import('./file-edit-engine.js');
+
+        const output: string[] = [];
+        let totalMatches = 0;
+
+        for (const uri of uris) {
+          if (totalMatches >= maxResults) break;
+          const matches = await searchInFile(uri.fsPath, pattern, isRegex);
+          if (matches.length === 0) continue;
+
+          const rel = path.relative(workspaceRoot, uri.fsPath).replace(/\\/g, '/');
+          output.push(`📄 ${rel}`);
+          for (const m of matches) {
+            if (totalMatches >= maxResults) { output.push('  ... (limit reached)'); break; }
+            output.push(`  Line ${m.line}:${m.column}  ${m.text.trim()}`);
+            totalMatches++;
+          }
+        }
+
+        if (output.length === 0) {
+          return { content: [{ type: 'text' as const, text: `No matches found for: ${pattern}` }] };
+        }
+
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `Search results for "${pattern}" (${totalMatches} match${totalMatches === 1 ? '' : 'es'}):\n\n${output.join('\n')}`,
+          }],
+        };
+      } catch (err) {
+        return { content: [{ type: 'text' as const, text: `Error searching files: ${err}` }], isError: true };
+      }
+    }
+  );
+
+  // ─────────────────────────────────────────────────────────
+  // Tool: get_open_editors
+  // ─────────────────────────────────────────────────────────
+  server.registerTool(
+    'get_open_editors',
+    {
+      title: 'Get Open Editors',
+      description: `List all files currently open in VS Code editor tabs.
+Returns file paths grouped by tab group, with the active (focused) file marked.
+Use this to understand what the user is currently looking at.`,
+      inputSchema: {},
+      annotations: { readOnlyHint: true },
+    },
+    async () => {
+      const workspaceRoot = getWorkspaceRoot();
+
+      const activeUri = vscode.window.activeTextEditor?.document.uri.fsPath;
+      const lines: string[] = [];
+
+      const tabGroups = vscode.window.tabGroups.all;
+      for (const group of tabGroups) {
+        if (tabGroups.length > 1) {
+          lines.push(`── Tab Group ${group.viewColumn} ──`);
+        }
+        for (const tab of group.tabs) {
+          const input = tab.input;
+          let filePath: string | undefined;
+
+          if (input instanceof vscode.TabInputText) {
+            filePath = input.uri.fsPath;
+          } else if (input instanceof vscode.TabInputTextDiff) {
+            filePath = input.modified.fsPath;
+          }
+
+          if (!filePath) continue;
+
+          const rel = workspaceRoot
+            ? path.relative(workspaceRoot, filePath).replace(/\\/g, '/')
+            : filePath;
+
+          const isActive = filePath === activeUri;
+          const isDirty = tab.isDirty ? ' [unsaved]' : '';
+          const marker = isActive ? '▶ ' : '  ';
+          lines.push(`${marker}${rel}${isDirty}`);
+        }
+      }
+
+      if (lines.length === 0) {
+        return { content: [{ type: 'text' as const, text: 'No files currently open in the editor.' }] };
+      }
+
+      return {
+        content: [{
+          type: 'text' as const,
+          text: `Open editors (▶ = active):\n\n${lines.join('\n')}`,
+        }],
+      };
     }
   );
 
