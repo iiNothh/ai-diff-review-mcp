@@ -31,7 +31,8 @@ export function createMcpServer(stateManager: StateManager): McpServer {
   async function finishEditAndReport(
     absolutePath: string,
     change: import('./types').PendingChange,
-    successMessage: string
+    successMessage: string,
+    runDiagnostics = false
   ) {
     const backupUri = stateManager.getBackupUri(change.id);
     const fileUri = vscode.Uri.file(absolutePath);
@@ -45,32 +46,24 @@ export function createMcpServer(stateManager: StateManager): McpServer {
 
     await vscode.commands.executeCommand('pendingAiChanges.focus');
 
-    const { collectDiagnostics } = await import('./diagnostics.js');
-    const { diagnosticsWaitMs, maxDiagnosticsPerEdit } = getConfig();
-    const { errors, warnings } = await collectDiagnostics(absolutePath, diagnosticsWaitMs);
-
     let diagText = '';
-    if (errors.length > 0 || warnings.length > 0) {
-      diagText = `\n\n⚠️ ${errors.length + warnings.length} diagnostic issue(s) detected after your edit:\n`;
-      const all = [...errors, ...warnings];
-      diagText += all.slice(0, maxDiagnosticsPerEdit).map(d => `  Line ${d.line}: [${d.severity}] ${d.message} (${d.source || ''})`).join('\n');
-      if (all.length > maxDiagnosticsPerEdit) diagText += `\n  ... and ${all.length - maxDiagnosticsPerEdit} more.`;
+    if (runDiagnostics) {
+      const { collectDiagnostics } = await import('./diagnostics.js');
+      const { diagnosticsWaitMs, maxDiagnosticsPerEdit } = getConfig();
+      const { errors, warnings } = await collectDiagnostics(absolutePath, diagnosticsWaitMs);
+      if (errors.length > 0 || warnings.length > 0) {
+        diagText = `\n\n⚠️ ${errors.length + warnings.length} diagnostic issue(s):\n`;
+        const all = [...errors, ...warnings];
+        diagText += all.slice(0, maxDiagnosticsPerEdit).map(d => `  Line ${d.line}: [${d.severity}] ${d.message}`).join('\n');
+        if (all.length > maxDiagnosticsPerEdit) diagText += `\n  ... and ${all.length - maxDiagnosticsPerEdit} more.`;
+      }
     }
 
     return {
-      content: [
-        {
-          type: 'text' as const,
-          text: [
-            `✅ ${successMessage}`,
-            `File: ${absolutePath}`,
-            `Change ID: ${change.id}`,
-            ``,
-            `A diff view has been opened in VS Code for user review.`,
-            `Waiting for the user to Accept or Reject this change.${diagText}`,
-          ].join('\n'),
-        },
-      ],
+      content: [{
+        type: 'text' as const,
+        text: `✅ ${successMessage}\nFile: ${absolutePath}\nChange ID: ${change.id}\nDiff opened for user review.${diagText}`,
+      }],
     };
   }
 
@@ -81,47 +74,67 @@ export function createMcpServer(stateManager: StateManager): McpServer {
     'read_file',
     {
       title: 'Read File',
-      description: `Read the content of a file. Reads the in-memory editor buffer first (captures unsaved changes),
-falling back to disk. Use this before edit_block to get the current exact content.`,
+      description: `Read the content of a file with line numbers. Reads the in-memory editor buffer first (captures unsaved changes).
+Use before edit_block to get exact content and line numbers for startLine.
+
+Modes:
+- Default: returns entire file with line numbers
+- startLine/endLine: returns a slice of the file
+- symbols: returns function/class/variable outline with line numbers (no content, minimal tokens)`,
       inputSchema: {
         filePath: z.string().describe('Absolute or workspace-relative file path'),
-        startLine: z.number().optional().describe('First line to return (1-indexed, inclusive). Omit for full file.'),
-        endLine: z.number().optional().describe('Last line to return (1-indexed, inclusive). Omit for full file.'),
+        startLine: z.number().optional().describe('First line to return (1-indexed, inclusive).'),
+        endLine: z.number().optional().describe('Last line to return (1-indexed, inclusive).'),
+        mode: z.enum(['content', 'symbols']).default('content').describe('"content" returns file text with line numbers (default). "symbols" returns outline of functions/classes/variables with line numbers only.'),
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ filePath, startLine, endLine }) => {
+    async ({ filePath, startLine, endLine, mode }) => {
       const workspaceRoot = getWorkspaceRoot();
       if (!workspaceRoot) {
         return { content: [{ type: 'text' as const, text: 'Error: No workspace folder open.' }], isError: true };
       }
       const absolutePath = resolveAbsolutePath(filePath, workspaceRoot);
+      const uri = vscode.Uri.file(absolutePath);
 
       try {
-        const uri = vscode.Uri.file(absolutePath);
-        const doc = await vscode.workspace.openTextDocument(uri);
-        const fullText = doc.getText();
-
-        if (startLine !== undefined || endLine !== undefined) {
-          const lines = fullText.split('\n');
-          const total = lines.length;
-          const from = Math.max(1, startLine ?? 1) - 1;
-          const to = Math.min(total, endLine ?? total);
-          const slice = lines.slice(from, to).join('\n');
-          return {
-            content: [{
-              type: 'text' as const,
-              text: `File: ${absolutePath}\nLines ${from + 1}-${to} of ${total}:\n\n${slice}`,
-            }],
-          };
+        if (mode === 'symbols') {
+          const symbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
+            'vscode.executeDocumentSymbolProvider', uri
+          );
+          if (!symbols || symbols.length === 0) {
+            return { content: [{ type: 'text' as const, text: `No symbols found in: ${absolutePath}\n(File may not be open or language server not ready — try mode: "content" instead)` }] };
+          }
+          const lines: string[] = [`Symbols in ${path.relative(workspaceRoot, absolutePath).replace(/\\/g, '/')}:\n`];
+          function flattenSymbols(syms: vscode.DocumentSymbol[], indent = '') {
+            for (const s of syms) {
+              const kind = vscode.SymbolKind[s.kind] ?? s.kind;
+              lines.push(`${indent}${s.name} [${kind}] — line ${s.range.start.line + 1}`);
+              if (s.children?.length) flattenSymbols(s.children, indent + '  ');
+            }
+          }
+          flattenSymbols(symbols);
+          return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
         }
 
-        return {
-          content: [{
-            type: 'text' as const,
-            text: `File: ${absolutePath}\nLines: ${doc.lineCount}\n\n${fullText}`,
-          }],
-        };
+        // content mode
+        const doc = await vscode.workspace.openTextDocument(uri);
+        const rawLines = doc.getText().split('\n');
+        const total = rawLines.length;
+        const from = Math.max(1, startLine ?? 1) - 1;
+        const to = Math.min(total, endLine ?? total);
+        const slice = rawLines.slice(from, to);
+
+        const width = String(to).length;
+        const numbered = slice
+          .map((l, i) => `${String(from + i + 1).padStart(width)} ${l}`)
+          .join('\n');
+
+        const header = startLine !== undefined || endLine !== undefined
+          ? `File: ${absolutePath}\nLines ${from + 1}-${to} of ${total}:\n\n`
+          : `File: ${absolutePath}\nTotal lines: ${total}\n\n`;
+
+        return { content: [{ type: 'text' as const, text: header + numbered }] };
       } catch (err) {
         return { content: [{ type: 'text' as const, text: `Error reading file: ${err}` }], isError: true };
       }
@@ -431,10 +444,11 @@ All edits on the same file are grouped into a single diff entry for the user.`,
         })).min(1).describe('List of edits to apply. Applied in startLine order.'),
         description: z.string().optional(),
         conversationId: z.string().optional(),
+        runDiagnostics: z.boolean().default(false).describe('Run language server diagnostics after edit and include results (default: false).'),
       },
       annotations: { destructiveHint: false },
     },
-    async ({ filePath, edits, description, conversationId }) => {
+    async ({ filePath, edits, description, conversationId, runDiagnostics }) => {
       const workspaceRoot = getWorkspaceRoot();
       if (!workspaceRoot) {
         return { content: [{ type: 'text' as const, text: 'Error: No workspace folder open.' }], isError: true };
@@ -452,7 +466,12 @@ All edits on the same file are grouped into a single diff entry for the user.`,
             operationResult = await performBatchLineAnchoredReplace(absolutePath, edits);
             if (!operationResult.success) {
               const failures = operationResult.results
-                .map((r: any) => `Edit ${r.editIndex + 1} (startLine ${edits[r.editIndex]?.startLine}): ${r.message}`)
+                .map((r: any) => {
+                  const actualSnippet = r.actualContent
+                    ? '\n' + (r.actualContent.split('\n').slice(0, 8).join('\n'))
+                    : '';
+                  return `Edit ${r.editIndex + 1} (startLine ${edits[r.editIndex]?.startLine}): ${r.message.split('\n')[0]}${actualSnippet}`;
+                })
                 .join('\n\n');
               throw new Error(failures);
             }
@@ -463,7 +482,7 @@ All edits on the same file are grouped into a single diff entry for the user.`,
         );
 
         const locations = edits.map(e => `line ${e.startLine}`).join(', ');
-        return await finishEditAndReport(absolutePath, change, `${edits.length} edit(s) applied successfully (${locations}).`);
+        return await finishEditAndReport(absolutePath, change, `${edits.length} edit(s) applied (${locations}).`, runDiagnostics);
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
         return { content: [{ type: 'text' as const, text: errMsg }], isError: true };
@@ -487,10 +506,11 @@ Examples: find all usages of a function, locate an import, find a config key.`,
         fileGlob: z.string().default('**/*').describe('Glob pattern to restrict which files are searched (e.g. "**/*.ts")'),
         excludeGlob: z.string().optional().describe('Glob pattern to exclude (default excludes node_modules, .git, out, dist)'),
         maxResults: z.number().default(100).describe('Maximum total matches to return (default 100)'),
+        contextLines: z.number().default(0).describe('Lines of context above and below each match (0 = matched line only, 2 = two lines above/below).'),
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ pattern, isRegex, fileGlob, excludeGlob, maxResults }) => {
+    async ({ pattern, isRegex, fileGlob, excludeGlob, maxResults, contextLines }) => {
       const workspaceRoot = getWorkspaceRoot();
       if (!workspaceRoot) {
         return { content: [{ type: 'text' as const, text: 'Error: No workspace folder open.' }], isError: true };
@@ -514,7 +534,22 @@ Examples: find all usages of a function, locate an import, find a config key.`,
           output.push(`📄 ${rel}`);
           for (const m of matches) {
             if (totalMatches >= maxResults) { output.push('  ... (limit reached)'); break; }
-            output.push(`  Line ${m.line}:${m.column}  ${m.text.trim()}`);
+            // context: 2 lines above and below, or just the matched line
+            if (contextLines > 0) {
+              const fileLines = (await import('fs/promises')).readFile(uri.fsPath, 'utf-8').then(c => c.split(/\r?\n|\r/)).catch(() => [] as string[]);
+              const all = await fileLines;
+              const from = Math.max(0, m.line - 1 - contextLines);
+              const to = Math.min(all.length, m.line + contextLines);
+              const width = String(to).length;
+              const block = all.slice(from, to).map((l, i) => {
+                const ln = from + i + 1;
+                const marker = ln === m.line ? '▶' : ' ';
+                return `  ${marker} ${String(ln).padStart(width)} ${l}`;
+              }).join('\n');
+              output.push(block);
+            } else {
+              output.push(`  Line ${m.line}:${m.column}  ${m.text.trim()}`);
+            }
             totalMatches++;
           }
         }
@@ -652,10 +687,11 @@ Each rejection includes the original content, the rejected AI content, and an op
       inputSchema: {
         limit: z.number().optional().default(10).describe('Max number of rejections to return (default 10)'),
         conversationId: z.string().optional().describe('Filter by conversation ID (optional)'),
+        contentLimit: z.number().optional().default(500).describe('Max characters of content to show per entry (default 500, 0 = unlimited)'),
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ limit, conversationId }) => {
+    async ({ limit, conversationId, contentLimit }) => {
       let rejected = stateManager.getRejectedChanges(limit ?? 10);
       if (conversationId) {
         rejected = rejected.filter(r => r.conversationId === conversationId);
@@ -664,6 +700,9 @@ Each rejection includes the original content, the rejected AI content, and an op
       if (rejected.length === 0) {
         return { content: [{ type: 'text' as const, text: 'No rejected changes found.' }] };
       }
+
+      const cap = contentLimit ?? 500;
+      const truncate = (s: string) => cap > 0 && s.length > cap ? s.slice(0, cap) + '\n...(truncated)' : s;
 
       const lines = rejected.map((r, i) =>
         [
@@ -675,10 +714,10 @@ Each rejection includes the original content, the rejected AI content, and an op
           r.description ? `Description: ${r.description}` : null,
           ``,
           `=== Original Content (what was restored) ===`,
-          r.originalContent.slice(0, 500) + (r.originalContent.length > 500 ? '\n...(truncated)' : ''),
+          truncate(r.originalContent),
           ``,
           `=== Rejected Content (what AI wrote) ===`,
-          r.rejectedContent.slice(0, 500) + (r.rejectedContent.length > 500 ? '\n...(truncated)' : ''),
+          truncate(r.rejectedContent),
         ]
           .filter(line => line !== null)
           .join('\n')
