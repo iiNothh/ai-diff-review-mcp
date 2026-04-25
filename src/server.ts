@@ -12,13 +12,27 @@ export function createMcpServer(stateManager: StateManager): McpServer {
     version: '0.1.0',
   });
 
-  // Helper to open diff and run diagnostics
+  function getConfig() {
+    const cfg = vscode.workspace.getConfiguration('aiDiffReview');
+    return {
+      diagnosticsWaitMs: cfg.get<number>('diagnosticsWaitMs', 500),
+      maxDiagnosticsPerEdit: cfg.get<number>('maxDiagnosticsPerEdit', 10),
+    };
+  }
+
+  function resolveAbsolutePath(filePath: string, workspaceRoot: string): string {
+    return path.isAbsolute(filePath) ? filePath : path.join(workspaceRoot, filePath);
+  }
+
+  function getWorkspaceRoot(): string | null {
+    return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null;
+  }
+
   async function finishEditAndReport(
-    absolutePath: string, 
-    change: import('./types').PendingChange, 
+    absolutePath: string,
+    change: import('./types').PendingChange,
     successMessage: string
   ) {
-    // Open the diff view in VS Code
     const backupUri = stateManager.getBackupUri(change.id);
     const fileUri = vscode.Uri.file(absolutePath);
     const diffTitle = `AI Edit: ${path.basename(absolutePath)} [${change.id.slice(0, 8)}]`;
@@ -29,19 +43,18 @@ export function createMcpServer(stateManager: StateManager): McpServer {
       await vscode.window.showTextDocument(fileUri);
     }
 
-    // Focus the pending changes sidebar
     await vscode.commands.executeCommand('pendingAiChanges.focus');
 
-    // Run diagnostics
     const { collectDiagnostics } = await import('./diagnostics.js');
-    const { errors, warnings } = await collectDiagnostics(absolutePath);
-    
-    let diagText = "";
+    const { diagnosticsWaitMs, maxDiagnosticsPerEdit } = getConfig();
+    const { errors, warnings } = await collectDiagnostics(absolutePath, diagnosticsWaitMs);
+
+    let diagText = '';
     if (errors.length > 0 || warnings.length > 0) {
       diagText = `\n\n⚠️ ${errors.length + warnings.length} diagnostic issue(s) detected after your edit:\n`;
       const all = [...errors, ...warnings];
-      diagText += all.slice(0, 10).map(d => `  Line ${d.line}: [${d.severity}] ${d.message} (${d.source || ''})`).join('\n');
-      if (all.length > 10) diagText += `\n  ... and ${all.length - 10} more.`;
+      diagText += all.slice(0, maxDiagnosticsPerEdit).map(d => `  Line ${d.line}: [${d.severity}] ${d.message} (${d.source || ''})`).join('\n');
+      if (all.length > maxDiagnosticsPerEdit) diagText += `\n  ... and ${all.length - maxDiagnosticsPerEdit} more.`;
     }
 
     return {
@@ -62,28 +75,315 @@ export function createMcpServer(stateManager: StateManager): McpServer {
   }
 
   // ─────────────────────────────────────────────────────────
-  // Tool: write_file
+  // Tool: read_file
   // ─────────────────────────────────────────────────────────
-  server.tool(
-    'write_file',
-    `Write or append complete content to a file. 
-    Use this if you are replacing the ENTIRE file or appending to it. 
-    For smaller, surgical fixes in large files, use edit_block instead.
-    Saves state, backups original, and opens diff reviewer.`,
+  server.registerTool(
+    'read_file',
     {
-      filePath: z.string().describe('Absolute or workspace-relative file path'),
-      content: z.string().describe('Content to write'),
-      mode: z.enum(['rewrite', 'append']).default('rewrite').describe('rewrite (default) or append'),
-      description: z.string().optional().describe('Description of the edit'),
-      conversationId: z.string().optional().describe('ID of current AI conversation'),
+      title: 'Read File',
+      description: `Read the content of a file. Reads the in-memory editor buffer first (captures unsaved changes),
+falling back to disk. Use this before edit_block to get the current exact content.`,
+      inputSchema: {
+        filePath: z.string().describe('Absolute or workspace-relative file path'),
+        startLine: z.number().optional().describe('First line to return (1-indexed, inclusive). Omit for full file.'),
+        endLine: z.number().optional().describe('Last line to return (1-indexed, inclusive). Omit for full file.'),
+      },
+      annotations: { readOnlyHint: true },
     },
-    async ({ filePath, content, mode, description, conversationId }) => {
-      const workspaceFolders = vscode.workspace.workspaceFolders;
-      if (!workspaceFolders?.length) {
+    async ({ filePath, startLine, endLine }) => {
+      const workspaceRoot = getWorkspaceRoot();
+      if (!workspaceRoot) {
         return { content: [{ type: 'text' as const, text: 'Error: No workspace folder open.' }], isError: true };
       }
-      const workspaceRoot = workspaceFolders[0].uri.fsPath;
-      const absolutePath = path.isAbsolute(filePath) ? filePath : path.join(workspaceRoot, filePath);
+      const absolutePath = resolveAbsolutePath(filePath, workspaceRoot);
+
+      try {
+        const uri = vscode.Uri.file(absolutePath);
+        const doc = await vscode.workspace.openTextDocument(uri);
+        const fullText = doc.getText();
+
+        if (startLine !== undefined || endLine !== undefined) {
+          const lines = fullText.split('\n');
+          const total = lines.length;
+          const from = Math.max(1, startLine ?? 1) - 1;
+          const to = Math.min(total, endLine ?? total);
+          const slice = lines.slice(from, to).join('\n');
+          return {
+            content: [{
+              type: 'text' as const,
+              text: `File: ${absolutePath}\nLines ${from + 1}-${to} of ${total}:\n\n${slice}`,
+            }],
+          };
+        }
+
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `File: ${absolutePath}\nLines: ${doc.lineCount}\n\n${fullText}`,
+          }],
+        };
+      } catch (err) {
+        return { content: [{ type: 'text' as const, text: `Error reading file: ${err}` }], isError: true };
+      }
+    }
+  );
+
+  // ─────────────────────────────────────────────────────────
+  // Tool: list_files
+  // ─────────────────────────────────────────────────────────
+  server.registerTool(
+    'list_files',
+    {
+      title: 'List Files',
+      description: `List files in the workspace matching a glob pattern.
+Use this to explore the project structure before reading or editing files.
+Examples: "**/*.ts", "src/**/*.{ts,tsx}", "*.json"`,
+      inputSchema: {
+        pattern: z.string().default('**/*').describe('Glob pattern relative to workspace root (default: **/* lists all files)'),
+        excludePattern: z.string().optional().describe('Glob pattern to exclude (default excludes node_modules, .git, out, dist)'),
+        maxResults: z.number().default(200).describe('Maximum number of results to return (default 200)'),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ pattern, excludePattern, maxResults }) => {
+      const workspaceRoot = getWorkspaceRoot();
+      if (!workspaceRoot) {
+        return { content: [{ type: 'text' as const, text: 'Error: No workspace folder open.' }], isError: true };
+      }
+
+      try {
+        const exclude = excludePattern ?? '{**/node_modules/**,**/.git/**,**/out/**,**/dist/**,**/.vscode/mcp-diff-state/**}';
+        const uris = await vscode.workspace.findFiles(pattern, exclude, maxResults);
+
+        if (uris.length === 0) {
+          return { content: [{ type: 'text' as const, text: `No files found matching: ${pattern}` }] };
+        }
+
+        const lines = uris
+          .map(u => path.relative(workspaceRoot, u.fsPath).replace(/\\/g, '/'))
+          .sort()
+          .join('\n');
+
+        return {
+          content: [{
+            type: 'text' as const,
+            text: `Files matching "${pattern}" (${uris.length}${uris.length === maxResults ? '+' : ''}):\n\n${lines}`,
+          }],
+        };
+      } catch (err) {
+        return { content: [{ type: 'text' as const, text: `Error listing files: ${err}` }], isError: true };
+      }
+    }
+  );
+
+  // ─────────────────────────────────────────────────────────
+  // Tool: get_diagnostics
+  // ─────────────────────────────────────────────────────────
+  server.registerTool(
+    'get_diagnostics',
+    {
+      title: 'Get Diagnostics',
+      description: `Get current TypeScript/ESLint/language server errors and warnings for a file or the entire workspace.
+Use this to check the health of the codebase before or after edits, without making any changes.`,
+      inputSchema: {
+        filePath: z.string().optional().describe('File to check. Omit to get diagnostics for ALL workspace files.'),
+        severity: z.enum(['all', 'errors_only', 'warnings_only']).default('all').describe('Filter by severity (default: all)'),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ filePath, severity }) => {
+      const workspaceRoot = getWorkspaceRoot();
+      if (!workspaceRoot) {
+        return { content: [{ type: 'text' as const, text: 'Error: No workspace folder open.' }], isError: true };
+      }
+
+      try {
+        const { collectDiagnostics } = await import('./diagnostics.js');
+
+        if (filePath) {
+          const absolutePath = resolveAbsolutePath(filePath, workspaceRoot);
+          const { errors, warnings } = await collectDiagnostics(absolutePath, 0);
+          return formatDiagnosticsResult([{ file: absolutePath, errors, warnings }], severity, workspaceRoot);
+        }
+
+        // Workspace-wide diagnostics via VS Code API
+        const allDiags = vscode.languages.getDiagnostics();
+        const results = allDiags
+          .filter(([, diags]) => diags.length > 0)
+          .map(([uri, diags]) => {
+            const errors = diags
+              .filter(d => d.severity === vscode.DiagnosticSeverity.Error)
+              .map(d => ({
+                line: d.range.start.line + 1,
+                column: d.range.start.character + 1,
+                severity: 'error' as const,
+                message: d.message,
+                source: d.source,
+                code: typeof d.code === 'object' ? String(d.code.value) : String(d.code || ''),
+              }));
+            const warnings = diags
+              .filter(d => d.severity === vscode.DiagnosticSeverity.Warning)
+              .map(d => ({
+                line: d.range.start.line + 1,
+                column: d.range.start.character + 1,
+                severity: 'warning' as const,
+                message: d.message,
+                source: d.source,
+                code: typeof d.code === 'object' ? String(d.code.value) : String(d.code || ''),
+              }));
+            return { file: uri.fsPath, errors, warnings };
+          });
+
+        return formatDiagnosticsResult(results, severity, workspaceRoot);
+      } catch (err) {
+        return { content: [{ type: 'text' as const, text: `Error getting diagnostics: ${err}` }], isError: true };
+      }
+    }
+  );
+
+  // ─────────────────────────────────────────────────────────
+  // Tool: delete_file
+  // ─────────────────────────────────────────────────────────
+  server.registerTool(
+    'delete_file',
+    {
+      title: 'Delete File',
+      description: `Delete a file from the workspace. The deletion is tracked as a pending change shown in the diff panel.
+The user must Accept the deletion or Reject it (which restores the file from backup).`,
+      inputSchema: {
+        filePath: z.string().describe('Absolute or workspace-relative file path to delete'),
+        description: z.string().optional().describe('Reason for deletion'),
+        conversationId: z.string().optional().describe('ID of current AI conversation'),
+      },
+      annotations: { destructiveHint: true },
+    },
+    async ({ filePath, description, conversationId }) => {
+      const workspaceRoot = getWorkspaceRoot();
+      if (!workspaceRoot) {
+        return { content: [{ type: 'text' as const, text: 'Error: No workspace folder open.' }], isError: true };
+      }
+      const absolutePath = resolveAbsolutePath(filePath, workspaceRoot);
+
+      try {
+        const change = await stateManager.trackFileOperation(
+          absolutePath,
+          async () => {
+            await vscode.workspace.fs.delete(vscode.Uri.file(absolutePath));
+          },
+          'write_file',
+          description ?? `Delete ${path.basename(absolutePath)}`,
+          conversationId
+        );
+
+        await vscode.commands.executeCommand('pendingAiChanges.focus');
+
+        return {
+          content: [{
+            type: 'text' as const,
+            text: [
+              `✅ File queued for deletion: ${absolutePath}`,
+              `Change ID: ${change.id}`,
+              ``,
+              `The file has been deleted. The user can Reject this change to restore it.`,
+            ].join('\n'),
+          }],
+        };
+      } catch (err) {
+        return { content: [{ type: 'text' as const, text: `Error deleting file: ${err}` }], isError: true };
+      }
+    }
+  );
+
+  // ─────────────────────────────────────────────────────────
+  // Tool: rename_file
+  // ─────────────────────────────────────────────────────────
+  server.registerTool(
+    'rename_file',
+    {
+      title: 'Rename / Move File',
+      description: `Rename or move a file within the workspace. Uses VS Code's WorkspaceEdit API so the operation
+is visible in the editor. The original path is backed up so the user can Reject to undo.`,
+      inputSchema: {
+        oldPath: z.string().describe('Current file path (absolute or workspace-relative)'),
+        newPath: z.string().describe('New file path (absolute or workspace-relative)'),
+        description: z.string().optional().describe('Reason for the rename/move'),
+        conversationId: z.string().optional().describe('ID of current AI conversation'),
+      },
+      annotations: { destructiveHint: false },
+    },
+    async ({ oldPath, newPath, description, conversationId }) => {
+      const workspaceRoot = getWorkspaceRoot();
+      if (!workspaceRoot) {
+        return { content: [{ type: 'text' as const, text: 'Error: No workspace folder open.' }], isError: true };
+      }
+      const absoluteOldPath = resolveAbsolutePath(oldPath, workspaceRoot);
+      const absoluteNewPath = resolveAbsolutePath(newPath, workspaceRoot);
+
+      try {
+        const change = await stateManager.trackFileOperation(
+          absoluteOldPath,
+          async () => {
+            const edit = new vscode.WorkspaceEdit();
+            edit.renameFile(
+              vscode.Uri.file(absoluteOldPath),
+              vscode.Uri.file(absoluteNewPath),
+              { overwrite: false }
+            );
+            const ok = await vscode.workspace.applyEdit(edit);
+            if (!ok) throw new Error('WorkspaceEdit.renameFile returned false');
+          },
+          'write_file',
+          description ?? `Rename ${path.basename(absoluteOldPath)} → ${path.basename(absoluteNewPath)}`,
+          conversationId
+        );
+
+        await vscode.commands.executeCommand('pendingAiChanges.focus');
+
+        return {
+          content: [{
+            type: 'text' as const,
+            text: [
+              `✅ File renamed/moved successfully.`,
+              `From: ${absoluteOldPath}`,
+              `To:   ${absoluteNewPath}`,
+              `Change ID: ${change.id}`,
+              ``,
+              `The user can Reject this change to restore the original filename.`,
+            ].join('\n'),
+          }],
+        };
+      } catch (err) {
+        return { content: [{ type: 'text' as const, text: `Error renaming file: ${err}` }], isError: true };
+      }
+    }
+  );
+
+  // ─────────────────────────────────────────────────────────
+  // Tool: write_file
+  // ─────────────────────────────────────────────────────────
+  server.registerTool(
+    'write_file',
+    {
+      title: 'Write File',
+      description: `Write or append complete content to a file.
+Use this if you are replacing the ENTIRE file or appending to it.
+For smaller, surgical fixes in large files, use edit_block instead.
+Saves state, backups original, and opens diff reviewer.`,
+      inputSchema: {
+        filePath: z.string().describe('Absolute or workspace-relative file path'),
+        content: z.string().describe('Content to write'),
+        mode: z.enum(['rewrite', 'append']).default('rewrite').describe('rewrite (default) or append'),
+        description: z.string().optional().describe('Description of the edit'),
+        conversationId: z.string().optional().describe('ID of current AI conversation'),
+      },
+      annotations: { destructiveHint: false },
+    },
+    async ({ filePath, content, mode, description, conversationId }) => {
+      const workspaceRoot = getWorkspaceRoot();
+      if (!workspaceRoot) {
+        return { content: [{ type: 'text' as const, text: 'Error: No workspace folder open.' }], isError: true };
+      }
+      const absolutePath = resolveAbsolutePath(filePath, workspaceRoot);
 
       try {
         const { writeFileContent } = await import('./file-edit-engine.js');
@@ -104,46 +404,49 @@ export function createMcpServer(stateManager: StateManager): McpServer {
   // ─────────────────────────────────────────────────────────
   // Tool: edit_block
   // ─────────────────────────────────────────────────────────
-  server.tool(
+  server.registerTool(
     'edit_block',
-    `Apply a surgical find-and-replace edit to a file. 
-    Finds exact 'oldString' and replaces with 'newString'.
-    If exact match fails, fuzzy search automatically detects close matches and informs you.
-    Can be called multiple times on the same file; changes will be grouped in one diff.`,
     {
-      filePath: z.string().describe('Absolute or workspace-relative file path'),
-      oldString: z.string().describe('String to find and replace. Must match the target file exactly (or closely for fuzzy).'),
-      newString: z.string().describe('Replacement string.'),
-      expectedReplacements: z.number().default(1).describe('How many occurrences are expected to be replaced (default 1)'),
-      description: z.string().optional(),
-      conversationId: z.string().optional(),
+      title: 'Edit Block',
+      description: `Apply a surgical find-and-replace edit to a file.
+Finds exact 'oldString' and replaces with 'newString'.
+If exact match fails, fuzzy search automatically detects close matches and informs you.
+Can be called multiple times on the same file; changes will be grouped in one diff.`,
+      inputSchema: {
+        filePath: z.string().describe('Absolute or workspace-relative file path'),
+        oldString: z.string().describe('String to find and replace. Must match the target file exactly (or closely for fuzzy).'),
+        newString: z.string().describe('Replacement string.'),
+        expectedReplacements: z.number().default(1).describe('How many occurrences are expected to be replaced (default 1)'),
+        description: z.string().optional(),
+        conversationId: z.string().optional(),
+      },
+      annotations: { destructiveHint: false },
     },
     async ({ filePath, oldString, newString, expectedReplacements, description, conversationId }) => {
-      const workspaceFolders = vscode.workspace.workspaceFolders;
-      if (!workspaceFolders?.length) {
+      const workspaceRoot = getWorkspaceRoot();
+      if (!workspaceRoot) {
         return { content: [{ type: 'text' as const, text: 'Error: No workspace folder open.' }], isError: true };
       }
-      const workspaceRoot = workspaceFolders[0].uri.fsPath;
-      const absolutePath = path.isAbsolute(filePath) ? filePath : path.join(workspaceRoot, filePath);
+      const absolutePath = resolveAbsolutePath(filePath, workspaceRoot);
 
       let operationResult: any;
 
       try {
         const { performSearchReplace } = await import('./file-edit-engine.js');
-        
+
         const change = await stateManager.trackFileOperation(
           absolutePath,
           async () => {
             operationResult = await performSearchReplace(absolutePath, oldString, newString, expectedReplacements);
             if (!operationResult.success) {
-                throw new Error(operationResult.message);
+              throw new Error(operationResult.message);
             }
           },
           'edit_block',
           description,
           conversationId
         );
-        
+
         return await finishEditAndReport(absolutePath, change, `Edit block applied successfully.`);
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
@@ -155,11 +458,15 @@ export function createMcpServer(stateManager: StateManager): McpServer {
   // ─────────────────────────────────────────────────────────
   // Tool: get_pending_changes
   // ─────────────────────────────────────────────────────────
-  server.tool(
+  server.registerTool(
     'get_pending_changes',
-    'List all currently pending (user-unreviewed) AI file changes.',
     {
-      conversationId: z.string().optional().describe('Filter by conversation ID (optional)'),
+      title: 'Get Pending Changes',
+      description: 'List all currently pending (user-unreviewed) AI file changes.',
+      inputSchema: {
+        conversationId: z.string().optional().describe('Filter by conversation ID (optional)'),
+      },
+      annotations: { readOnlyHint: true },
     },
     async ({ conversationId }) => {
       let pending = stateManager.getAllPending();
@@ -168,9 +475,7 @@ export function createMcpServer(stateManager: StateManager): McpServer {
       }
 
       if (pending.length === 0) {
-        return {
-          content: [{ type: 'text', text: 'No pending AI changes.' }],
-        };
+        return { content: [{ type: 'text' as const, text: 'No pending AI changes.' }] };
       }
 
       const lines = pending.map((c, i) =>
@@ -185,12 +490,10 @@ export function createMcpServer(stateManager: StateManager): McpServer {
       );
 
       return {
-        content: [
-          {
-            type: 'text',
-            text: `Pending AI changes (${pending.length}):\n\n${lines.join('\n\n')}`,
-          },
-        ],
+        content: [{
+          type: 'text' as const,
+          text: `Pending AI changes (${pending.length}):\n\n${lines.join('\n\n')}`,
+        }],
       };
     }
   );
@@ -198,15 +501,19 @@ export function createMcpServer(stateManager: StateManager): McpServer {
   // ─────────────────────────────────────────────────────────
   // Tool: read_rejected_changes
   // ─────────────────────────────────────────────────────────
-  server.tool(
+  server.registerTool(
     'read_rejected_changes',
-    `Read the log of changes that the user rejected.
+    {
+      title: 'Read Rejected Changes',
+      description: `Read the log of changes that the user rejected.
 
 Use this to understand what the user disliked and avoid making the same mistakes.
 Each rejection includes the original content, the rejected AI content, and an optional reason.`,
-    {
-      limit: z.number().optional().default(10).describe('Max number of rejections to return (default 10)'),
-      conversationId: z.string().optional().describe('Filter by conversation ID (optional)'),
+      inputSchema: {
+        limit: z.number().optional().default(10).describe('Max number of rejections to return (default 10)'),
+        conversationId: z.string().optional().describe('Filter by conversation ID (optional)'),
+      },
+      annotations: { readOnlyHint: true },
     },
     async ({ limit, conversationId }) => {
       let rejected = stateManager.getRejectedChanges(limit ?? 10);
@@ -215,9 +522,7 @@ Each rejection includes the original content, the rejected AI content, and an op
       }
 
       if (rejected.length === 0) {
-        return {
-          content: [{ type: 'text', text: 'No rejected changes found.' }],
-        };
+        return { content: [{ type: 'text' as const, text: 'No rejected changes found.' }] };
       }
 
       const lines = rejected.map((r, i) =>
@@ -240,17 +545,47 @@ Each rejection includes the original content, the rejected AI content, and an op
       );
 
       return {
-        content: [
-          {
-            type: 'text',
-            text: `Rejected changes (${rejected.length}):\n\n${lines.join('\n\n')}`,
-          },
-        ],
+        content: [{
+          type: 'text' as const,
+          text: `Rejected changes (${rejected.length}):\n\n${lines.join('\n\n')}`,
+        }],
       };
     }
   );
 
   return server;
+}
+
+function formatDiagnosticsResult(
+  results: Array<{ file: string; errors: any[]; warnings: any[] }>,
+  severity: 'all' | 'errors_only' | 'warnings_only',
+  workspaceRoot: string
+): { content: Array<{ type: 'text'; text: string }> } {
+  const filtered = results.map(r => ({
+    file: r.file,
+    errors: severity === 'warnings_only' ? [] : r.errors,
+    warnings: severity === 'errors_only' ? [] : r.warnings,
+  })).filter(r => r.errors.length > 0 || r.warnings.length > 0);
+
+  if (filtered.length === 0) {
+    return { content: [{ type: 'text' as const, text: '✅ No diagnostics found.' }] };
+  }
+
+  const totalErrors = filtered.reduce((n, r) => n + r.errors.length, 0);
+  const totalWarnings = filtered.reduce((n, r) => n + r.warnings.length, 0);
+
+  const lines: string[] = [`Diagnostics: ${totalErrors} error(s), ${totalWarnings} warning(s)\n`];
+
+  for (const r of filtered) {
+    const rel = path.relative(workspaceRoot, r.file).replace(/\\/g, '/');
+    const all = [...r.errors, ...r.warnings];
+    lines.push(`📄 ${rel}`);
+    for (const d of all) {
+      lines.push(`  Line ${d.line}:${d.column} [${d.severity}] ${d.message}${d.source ? ` (${d.source})` : ''}`);
+    }
+  }
+
+  return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
 }
 
 /**
@@ -272,22 +607,18 @@ export async function startMcpServer(
 ): Promise<{ server: McpServer; httpServer: http.Server }> {
   const mcpServer = createMcpServer(stateManager);
 
-  // Session map — one transport per connected client session
   const transports = new Map<string, StreamableHTTPServerTransport>();
 
   const httpServer = http.createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', `http://127.0.0.1:${port}`);
 
-    // ── Health / discovery ────────────────────────────────────
     if (req.method === 'GET' && url.pathname === '/health') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'ok', name: 'vscode-diff-mcp', version: '0.1.0' }));
+      res.end(JSON.stringify({ status: 'ok', name: 'vscode-diff-mcp', version: '0.1.0', port }));
       return;
     }
 
-    // ── Streamable HTTP MCP endpoint (/mcp) ───────────────────
     if (url.pathname === '/mcp') {
-      // DELETE — client closing session explicitly
       if (req.method === 'DELETE') {
         const sessionId = req.headers['mcp-session-id'] as string | undefined;
         if (sessionId) {
@@ -301,16 +632,13 @@ export async function startMcpServer(
         return;
       }
 
-      // POST / GET — main MCP communication
       if (req.method === 'POST' || req.method === 'GET') {
         const sessionId = req.headers['mcp-session-id'] as string | undefined;
         let transport: StreamableHTTPServerTransport;
 
         if (sessionId && transports.has(sessionId)) {
-          // Resume existing session
           transport = transports.get(sessionId)!;
         } else if (!sessionId && req.method === 'POST') {
-          // New session — create a stateful transport
           transport = new StreamableHTTPServerTransport({
             sessionIdGenerator: () => crypto.randomUUID(),
             onsessioninitialized: (id) => {
@@ -318,7 +646,6 @@ export async function startMcpServer(
             },
           });
 
-          // Clean up on close
           transport.onclose = () => {
             if (transport.sessionId) {
               transports.delete(transport.sessionId);

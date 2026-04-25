@@ -15,6 +15,30 @@
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "configuration": {
+      "title": "AI Diff Review (MCP)",
+      "properties": {
+        "aiDiffReview.port": {
+          "type": "number",
+          "default": 6070,
+          "description": "Port for the MCP HTTP server. Restart VS Code after changing."
+        },
+        "aiDiffReview.diagnosticsWaitMs": {
+          "type": "number",
+          "default": 500,
+          "minimum": 0,
+          "maximum": 5000,
+          "description": "Milliseconds to wait for language servers before collecting diagnostics after an edit."
+        },
+        "aiDiffReview.maxDiagnosticsPerEdit": {
+          "type": "number",
+          "default": 10,
+          "minimum": 1,
+          "maximum": 50,
+          "description": "Maximum number of diagnostic issues to include in each edit response."
+        }
+      }
+    },
     "viewsContainers": {
       "activitybar": [
         {
