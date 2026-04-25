@@ -136,77 +136,105 @@ export async function performSearchReplace(filePath: string, oldString: string, 
     };
 }
 
+export interface EditOperation {
+    oldString: string;
+    newString: string;
+    startLine: number;
+}
+
+export type EditOperationResult =
+    | { success: true }
+    | { success: false; editIndex: number; message: string; actualContent: string };
+
 /**
- * Line-anchored search-and-replace.
- * Searches for oldString only within [startLine, endLine] (1-indexed, inclusive).
- * If oldString is found there exactly once, replaces it and writes the file.
- * If not found, returns the actual content of that range so the caller can correct.
+ * Apply multiple line-anchored edits to a file in a single pass.
+ *
+ * For each edit:
+ *   - startLine (1-indexed) is where oldString is expected to begin.
+ *   - The engine reads exactly as many characters as oldString from that line offset
+ *     and checks for an exact match — no full-file scan, no ambiguity.
+ *   - If the content at startLine differs (user edited it), the actual content
+ *     of that region is returned so the caller can self-correct.
+ *
+ * Edits are applied top-to-bottom on the in-memory content so line numbers
+ * remain stable relative to the original file. The file is written once at the end.
  */
-export async function performLineAnchoredReplace(
+export async function performBatchLineAnchoredReplace(
     filePath: string,
-    oldString: string,
-    newString: string,
-    startLine: number,
-    endLine: number
-): Promise<{ success: true; newContent: string } | { success: false; message: string; actualRange?: string }> {
+    edits: EditOperation[]
+): Promise<{ success: true; newContent: string } | { success: false; results: EditOperationResult[] }> {
     if (!fs.existsSync(filePath)) {
-        return { success: false, message: `File does not exist: ${filePath}` };
+        return {
+            success: false,
+            results: [{ success: false, editIndex: 0, message: `File does not exist: ${filePath}`, actualContent: '' }],
+        };
     }
 
-    const content = await fsPromises.readFile(filePath, 'utf-8');
-    const existingLineEnding = detectLineEnding(content);
-    const lines = content.split(/\r?\n|\r/);
+    const raw = await fsPromises.readFile(filePath, 'utf-8');
+    const existingLineEnding = detectLineEnding(raw);
+    const sep = existingLineEnding === '\r\n' ? '\r\n' : existingLineEnding === '\r' ? '\r' : '\n';
+
+    // Work on LF-normalised lines internally; re-join with original sep at end
+    let lines = raw.split(/\r?\n|\r/);
     const totalLines = lines.length;
 
-    if (startLine < 1 || endLine < startLine || startLine > totalLines) {
-        return {
-            success: false,
-            message: `Invalid line range ${startLine}-${endLine} for file with ${totalLines} lines.`,
-        };
+    // Sort edits by startLine ascending so offsets stay valid as we apply them
+    const sortedEdits = edits
+        .map((e, i) => ({ ...e, originalIndex: i }))
+        .sort((a, b) => a.startLine - b.startLine);
+
+    const failures: EditOperationResult[] = [];
+    let lineOffset = 0; // cumulative shift from previous edits that changed line count
+
+    for (const edit of sortedEdits) {
+        const { oldString, newString, startLine, originalIndex } = edit;
+        const adjustedStart = startLine - 1 + lineOffset; // 0-indexed
+
+        if (adjustedStart < 0 || adjustedStart >= lines.length) {
+            failures.push({
+                success: false,
+                editIndex: originalIndex,
+                message: `startLine ${startLine} is out of range (file has ${totalLines} lines).`,
+                actualContent: '',
+            });
+            continue;
+        }
+
+        // Build the normalized oldString and figure out how many lines it spans
+        const normalizedOld = normalizeLineEndings(oldString, sep as LineEndingStyle);
+        const oldLines = normalizedOld.split(/\r?\n|\r/);
+        const spanEnd = adjustedStart + oldLines.length; // exclusive
+
+        // Extract that exact region from the current (already-partially-edited) lines array
+        const regionLines = lines.slice(adjustedStart, spanEnd);
+        const regionText = regionLines.join(sep);
+
+        if (regionText !== normalizedOld) {
+            // Content at startLine doesn't match — return what's actually there
+            failures.push({
+                success: false,
+                editIndex: originalIndex,
+                message:
+                    `oldString does not match the file content at line ${startLine}.\n\n` +
+                    `Expected:\n${oldString}\n\nActual content at line ${startLine}:\n${regionText}\n\n` +
+                    `Please correct oldString to match the actual content exactly.`,
+                actualContent: regionText,
+            });
+            continue;
+        }
+
+        // Replace the region
+        const normalizedNew = normalizeLineEndings(newString, sep as LineEndingStyle);
+        const newLines = normalizedNew.split(/\r?\n|\r/);
+        lines = [...lines.slice(0, adjustedStart), ...newLines, ...lines.slice(spanEnd)];
+        lineOffset += newLines.length - oldLines.length;
     }
 
-    const clampedEnd = Math.min(endLine, totalLines);
-
-    // Extract the target range (0-indexed slicing)
-    const beforeLines = lines.slice(0, startLine - 1);
-    const rangeLines = lines.slice(startLine - 1, clampedEnd);
-    const afterLines = lines.slice(clampedEnd);
-
-    const sep = existingLineEnding === '\r\n' ? '\r\n' : existingLineEnding === '\r' ? '\r' : '\n';
-    const rangeText = rangeLines.join(sep);
-
-    const normalizedOld = normalizeLineEndings(oldString, existingLineEnding);
-    const normalizedNew = normalizeLineEndings(newString, existingLineEnding);
-
-    const occurrences = rangeText.split(normalizedOld).length - 1;
-
-    if (occurrences === 0) {
-        return {
-            success: false,
-            message:
-                `oldString not found in lines ${startLine}-${clampedEnd}.\n\n` +
-                `Actual content of lines ${startLine}-${clampedEnd}:\n${rangeText}\n\n` +
-                `Please correct oldString to match the actual content exactly.`,
-            actualRange: rangeText,
-        };
+    if (failures.length > 0) {
+        return { success: false, results: failures };
     }
 
-    if (occurrences > 1) {
-        return {
-            success: false,
-            message:
-                `oldString appears ${occurrences} times in lines ${startLine}-${clampedEnd}. ` +
-                `Narrow the range or make oldString more specific.\n\n` +
-                `Actual content of lines ${startLine}-${clampedEnd}:\n${rangeText}`,
-            actualRange: rangeText,
-        };
-    }
-
-    const newRangeText = rangeText.replace(normalizedOld, normalizedNew);
-    const newRangeLines = newRangeText.split(/\r?\n|\r/);
-    const newLines = [...beforeLines, ...newRangeLines, ...afterLines];
-    const newContent = newLines.join(sep);
-
+    const newContent = lines.join(sep);
     await fsPromises.writeFile(filePath, newContent, 'utf-8');
     return { success: true, newContent };
 }

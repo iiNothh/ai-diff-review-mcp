@@ -408,28 +408,33 @@ Saves state, backups original, and opens diff reviewer.`,
     'edit_block',
     {
       title: 'Edit Block',
-      description: `Apply a surgical find-and-replace edit to a file.
+      description: `Apply one or more surgical edits to a file in a single call.
 
 IMPORTANT: Always call read_file first to get the exact current content and line numbers.
 
-Provide startLine and endLine to pin exactly where oldString appears (1-indexed, inclusive).
-The search is constrained to that range — if oldString is not found there, the actual content
-of that range is returned so you can correct it. This prevents accidentally replacing the wrong
-occurrence in files with repeated code.
+Each edit requires:
+  - startLine: the line where oldString begins (1-indexed). Used to verify the user
+    hasn't changed that region since you read the file. Only the content at that exact
+    line position is checked — no full-file scan.
+  - oldString: exact text starting at startLine. If it doesn't match, the actual
+    content at that line is returned so you can self-correct.
+  - newString: replacement text.
 
-Can be called multiple times on the same file; all changes are grouped in one diff entry.`,
+Pass multiple edits in the 'edits' array to change several places in one call.
+All edits on the same file are grouped into a single diff entry for the user.`,
       inputSchema: {
         filePath: z.string().describe('Absolute or workspace-relative file path'),
-        oldString: z.string().describe('Exact text to find and replace within the specified line range.'),
-        newString: z.string().describe('Replacement text.'),
-        startLine: z.number().describe('First line of the search range (1-indexed, inclusive).'),
-        endLine: z.number().describe('Last line of the search range (1-indexed, inclusive).'),
+        edits: z.array(z.object({
+          oldString: z.string().describe('Exact text to replace, starting at startLine.'),
+          newString: z.string().describe('Replacement text.'),
+          startLine: z.number().describe('Line number where oldString begins (1-indexed).'),
+        })).min(1).describe('List of edits to apply. Applied in startLine order.'),
         description: z.string().optional(),
         conversationId: z.string().optional(),
       },
       annotations: { destructiveHint: false },
     },
-    async ({ filePath, oldString, newString, startLine, endLine, description, conversationId }) => {
+    async ({ filePath, edits, description, conversationId }) => {
       const workspaceRoot = getWorkspaceRoot();
       if (!workspaceRoot) {
         return { content: [{ type: 'text' as const, text: 'Error: No workspace folder open.' }], isError: true };
@@ -439,14 +444,17 @@ Can be called multiple times on the same file; all changes are grouped in one di
       let operationResult: any;
 
       try {
-        const { performLineAnchoredReplace } = await import('./file-edit-engine.js');
+        const { performBatchLineAnchoredReplace } = await import('./file-edit-engine.js');
 
         const change = await stateManager.trackFileOperation(
           absolutePath,
           async () => {
-            operationResult = await performLineAnchoredReplace(absolutePath, oldString, newString, startLine, endLine);
+            operationResult = await performBatchLineAnchoredReplace(absolutePath, edits);
             if (!operationResult.success) {
-              throw new Error(operationResult.message);
+              const failures = operationResult.results
+                .map((r: any) => `Edit ${r.editIndex + 1} (startLine ${edits[r.editIndex]?.startLine}): ${r.message}`)
+                .join('\n\n');
+              throw new Error(failures);
             }
           },
           'edit_block',
@@ -454,10 +462,11 @@ Can be called multiple times on the same file; all changes are grouped in one di
           conversationId
         );
 
-        return await finishEditAndReport(absolutePath, change, `Edit block applied successfully (lines ${startLine}-${endLine}).`);
+        const locations = edits.map(e => `line ${e.startLine}`).join(', ');
+        return await finishEditAndReport(absolutePath, change, `${edits.length} edit(s) applied successfully (${locations}).`);
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
-        return { content: [{ type: 'text' as const, text: `${errMsg}` }], isError: true };
+        return { content: [{ type: 'text' as const, text: errMsg }], isError: true };
       }
     }
   );
